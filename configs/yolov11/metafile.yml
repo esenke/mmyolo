@@ -1,0 +1,33 @@
+Collections:
+  - Name: YOLOv11
+    Metadata:
+      Training Data: COCO
+      Training Techniques:
+        - SGD with Nesterov
+        - Weight Decay
+        - AMP
+        - Synchronize BN
+      Training Resources: 8x A100 GPUs
+      Architecture:
+        - CSPDarkNet
+        - PAFPN
+        - Decoupled Head
+        - CIB Blocks
+    README: configs/yolov11/README.md
+    Code:
+      URL: https://github.com/open-mmlab/mmyolo/blob/main/mmyolo/models/detectors/yolo_detector.py#L12
+      Version: v0.6.0
+
+Models:
+  - Name: yolov11_s_syncbn_fast_8xb16-500e_coco
+    In Collection: YOLOv11
+    Config: configs/yolov11/yolov11_s_syncbn_fast_8xb16-500e_coco.py
+    Metadata:
+      Training Memory (GB): TBD
+      Epochs: 500
+    Results:
+      - Task: Object Detection
+        Dataset: COCO
+        Metrics:
+          box AP: TBD
+    Weights: null

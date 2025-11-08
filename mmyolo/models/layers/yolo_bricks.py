@@ -1438,6 +1438,167 @@ class DarknetBottleneck(MMDET_DarknetBottleneck):
             add_identity and in_channels == out_channels
 
 
+@MODELS.register_module()
+class CIB(BaseModule):
+    """Contextual information block used by YOLOv11 style architectures.
+
+    The block stacks a point-wise projection, a depthwise convolution and
+    another point-wise projection to enhance local context while keeping the
+    parameter size lightweight. A residual connection is used when the input
+    and output shapes match.
+
+    Args:
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+        expansion (float): Channel expansion ratio for the hidden layer.
+            Defaults to 0.5.
+        kernel_size (int): Kernel size of the depthwise convolution.
+            Defaults to 3.
+        stride (int): Stride of the depthwise convolution. Defaults to 1.
+        add_identity (bool): Whether to add the residual connection.
+            Defaults to True.
+        conv_cfg (dict, optional): Config dict for convolution layer.
+            Defaults to None, which means using ``nn.Conv2d``.
+        norm_cfg (dict): Config dict for normalization layer.
+        act_cfg (dict): Config dict for activation layer.
+        init_cfg (dict or list[dict], optional): Initialization config dict.
+            Defaults to None.
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 expansion: float = 0.5,
+                 kernel_size: int = 3,
+                 stride: int = 1,
+                 add_identity: bool = True,
+                 conv_cfg: OptConfigType = None,
+                 norm_cfg: ConfigType = dict(
+                     type='BN', momentum=0.03, eps=0.001),
+                 act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+                 init_cfg: OptMultiConfig = None) -> None:
+        super().__init__(init_cfg=init_cfg)
+
+        hidden_channels = max(1, int(out_channels * expansion))
+        padding = kernel_size // 2
+
+        self.conv1 = ConvModule(
+            in_channels,
+            hidden_channels,
+            1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+        self.dw_conv = ConvModule(
+            hidden_channels,
+            hidden_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=hidden_channels,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+        self.conv2 = ConvModule(
+            hidden_channels,
+            out_channels,
+            1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+        self.add_identity = add_identity and stride == 1 \
+            and in_channels == out_channels
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward process."""
+        identity = x
+        x = self.conv1(x)
+        x = self.dw_conv(x)
+        x = self.conv2(x)
+        if self.add_identity:
+            x = x + identity
+        return x
+
+
+@MODELS.register_module()
+class C2fCIB(BaseModule):
+    """CSP layer that utilises :class:`CIB` blocks.
+
+    This block follows the two-conv split strategy used by YOLOv8's
+    ``CSPLayerWithTwoConv`` but swaps the internal bottleneck with the
+    ``CIB`` block which provides a better trade-off between accuracy and
+    efficiency for YOLOv11 models.
+
+    Args:
+        in_channels (int): Input channels of the CSP layer.
+        out_channels (int): Output channels of the CSP layer.
+        expand_ratio (float): Ratio to adjust channels for the hidden layer.
+            Defaults to 0.5.
+        num_blocks (int): Number of ``CIB`` blocks. Defaults to 1.
+        add_identity (bool): Whether to use residual connections inside
+            ``CIB`` blocks. Defaults to True.
+        cib_expand_ratio (float): Channel expansion ratio of the ``CIB``
+            blocks. Defaults to 0.5.
+        conv_cfg (dict, optional): Config dict for convolution layer.
+            Defaults to None.
+        norm_cfg (dict): Config dict for normalization layer.
+        act_cfg (dict): Config dict for activation layer.
+        init_cfg (dict or list[dict], optional): Initialization config dict.
+            Defaults to None.
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 expand_ratio: float = 0.5,
+                 num_blocks: int = 1,
+                 add_identity: bool = True,
+                 cib_expand_ratio: float = 0.5,
+                 conv_cfg: OptConfigType = None,
+                 norm_cfg: ConfigType = dict(
+                     type='BN', momentum=0.03, eps=0.001),
+                 act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+                 init_cfg: OptMultiConfig = None) -> None:
+        super().__init__(init_cfg=init_cfg)
+
+        self.mid_channels = int(out_channels * expand_ratio)
+        self.blocks = nn.ModuleList(
+            CIB(
+                self.mid_channels,
+                self.mid_channels,
+                expansion=cib_expand_ratio,
+                kernel_size=3,
+                stride=1,
+                add_identity=add_identity,
+                conv_cfg=conv_cfg,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg,
+                init_cfg=None) for _ in range(num_blocks))
+
+        self.main_conv = ConvModule(
+            in_channels,
+            2 * self.mid_channels,
+            1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+        self.final_conv = ConvModule(
+            (2 + num_blocks) * self.mid_channels,
+            out_channels,
+            1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Forward process."""
+        x_main = self.main_conv(x)
+        x_main = list(x_main.split((self.mid_channels, self.mid_channels), 1))
+        for block in self.blocks:
+            x_main.append(block(x_main[-1]))
+        return self.final_conv(torch.cat(x_main, 1))
+
+
 class CSPLayerWithTwoConv(BaseModule):
     """Cross Stage Partial Layer with 2 convolutions.
 
