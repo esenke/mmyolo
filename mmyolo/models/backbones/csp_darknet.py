@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from copy import deepcopy
 from typing import List, Tuple, Union
 
 import torch
@@ -8,7 +9,7 @@ from mmdet.models.backbones.csp_darknet import CSPLayer, Focus
 from mmdet.utils import ConfigType, OptMultiConfig
 
 from mmyolo.registry import MODELS
-from ..layers import CSPLayerWithTwoConv, SPPFBottleneck
+from ..layers import C2fCIB, CSPLayerWithTwoConv, SPPFBottleneck
 from ..utils import make_divisible, make_round
 from .base_backbone import BaseBackbone
 
@@ -294,6 +295,131 @@ class YOLOv8CSPDarknet(BaseBackbone):
                 if isinstance(m, torch.nn.Conv2d):
                     # In order to be consistent with the source code,
                     # reset the Conv2d initialization parameters
+                    m.reset_parameters()
+        else:
+            super().init_weights()
+
+
+@MODELS.register_module()
+class YOLOv11CSPDarknet(BaseBackbone):
+    """CSP-Darknet backbone used in YOLOv11.
+
+    The structure is derived from YOLOv8 but replaces the CSP bottleneck with
+    the newly introduced :class:`C2fCIB` blocks to better capture local
+    context while keeping the computation light-weight.
+
+    Args:
+        arch (str): Architecture of CSP-Darknet, currently only ``P5`` is
+            supported. Defaults to ``P5``.
+        last_stage_out_channels (int): Final stage output channel.
+            Defaults to 1024.
+        plugins (list[dict]): List of plugins for stages, each dict contains
+            the same fields as :class:`BaseBackbone`. Defaults to None.
+        deepen_factor (float): Depth multiplier. Defaults to 1.0.
+        widen_factor (float): Width multiplier. Defaults to 1.0.
+        input_channels (int): Number of input channels. Defaults to 3.
+        out_indices (Tuple[int]): Output from which stages. Defaults to
+            ``(2, 3, 4)``.
+        frozen_stages (int): Stages to be frozen. Defaults to -1.
+        c2f_expand_ratio (float): Channel expansion ratio used by
+            :class:`C2fCIB`. Defaults to 0.5.
+        cib_expand_ratio (float): Channel expansion ratio inside ``CIB``
+            blocks. Defaults to 0.5.
+        norm_cfg (dict): Dictionary to construct and config norm layer.
+        act_cfg (dict): Config dict for activation layer.
+        norm_eval (bool): Whether to set norm layers to eval mode.
+        init_cfg (dict or list[dict], optional): Initialization config dict.
+            Defaults to None.
+    """
+
+    arch_settings = {
+        'P5': [[64, 128, 3, True, False], [128, 256, 6, True, False],
+               [256, 512, 6, True, False], [512, None, 3, True, True]],
+    }
+
+    def __init__(self,
+                 arch: str = 'P5',
+                 last_stage_out_channels: int = 1024,
+                 plugins: Union[dict, List[dict]] = None,
+                 deepen_factor: float = 1.0,
+                 widen_factor: float = 1.0,
+                 input_channels: int = 3,
+                 out_indices: Tuple[int] = (2, 3, 4),
+                 frozen_stages: int = -1,
+                 c2f_expand_ratio: float = 0.5,
+                 cib_expand_ratio: float = 0.5,
+                 norm_cfg: ConfigType = dict(
+                     type='BN', momentum=0.03, eps=0.001),
+                 act_cfg: ConfigType = dict(type='SiLU', inplace=True),
+                 norm_eval: bool = False,
+                 init_cfg: OptMultiConfig = None):
+        arch_setting = deepcopy(self.arch_settings[arch])
+        arch_setting[-1][1] = last_stage_out_channels
+        self.c2f_expand_ratio = c2f_expand_ratio
+        self.cib_expand_ratio = cib_expand_ratio
+        super().__init__(
+            arch_setting,
+            deepen_factor,
+            widen_factor,
+            input_channels=input_channels,
+            out_indices=out_indices,
+            plugins=plugins,
+            frozen_stages=frozen_stages,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+            norm_eval=norm_eval,
+            init_cfg=init_cfg)
+
+    def build_stem_layer(self) -> nn.Module:
+        return ConvModule(
+            self.input_channels,
+            make_divisible(self.arch_setting[0][0], self.widen_factor),
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg)
+
+    def build_stage_layer(self, stage_idx: int, setting: list) -> list:
+        in_channels, out_channels, num_blocks, add_identity, use_spp = setting
+
+        in_channels = make_divisible(in_channels, self.widen_factor)
+        out_channels = make_divisible(out_channels, self.widen_factor)
+        num_blocks = make_round(num_blocks, self.deepen_factor)
+        stage = []
+        stage.append(
+            ConvModule(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg))
+        stage.append(
+            C2fCIB(
+                out_channels,
+                out_channels,
+                expand_ratio=self.c2f_expand_ratio,
+                num_blocks=num_blocks,
+                add_identity=add_identity,
+                cib_expand_ratio=self.cib_expand_ratio,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg))
+        if use_spp:
+            stage.append(
+                SPPFBottleneck(
+                    out_channels,
+                    out_channels,
+                    kernel_sizes=5,
+                    norm_cfg=self.norm_cfg,
+                    act_cfg=self.act_cfg))
+        return stage
+
+    def init_weights(self):
+        if self.init_cfg is None:
+            for m in self.modules():
+                if isinstance(m, torch.nn.Conv2d):
                     m.reset_parameters()
         else:
             super().init_weights()
